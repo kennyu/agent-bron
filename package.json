@@ -1,0 +1,24 @@
+{
+  "name": "agentic-tasks",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "dev": "bun run apps/api/src/index.ts",
+    "db:generate": "bunx drizzle-kit generate",
+    "db:migrate": "bunx drizzle-kit migrate",
+    "db:studio": "bunx drizzle-kit studio"
+  },
+  "dependencies": {
+    "@anthropic-ai/claude-agent-sdk": "^0.1.69",
+    "drizzle-orm": "^0.45.1",
+    "hono": "^4.6.0",
+    "@hono/zod-validator": "^0.4.0",
+    "postgres": "^3.4.0",
+    "zod": "^3.24.0"
+  },
+  "devDependencies": {
+    "@types/bun": "latest",
+    "drizzle-kit": "^0.31.8",
+    "typescript": "^5.0.0"
+  }
+}

@@ -1,0 +1,25 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "strict": true,
+    "skipLibCheck": true,
+    "esModuleInterop": true,
+    "allowSyntheticDefaultImports": true,
+    "resolveJsonModule": true,
+    "isolatedModules": true,
+    "noEmit": true,
+    "paths": {
+      "@repo/shared-types": ["./packages/shared-types/src/index.ts"],
+      "@repo/db": ["./packages/db/src/index.ts"]
+    }
+  },
+  "include": [
+    "apps/**/*.ts",
+    "packages/**/*.ts"
+  ],
+  "exclude": [
+    "node_modules"
+  ]
+}
