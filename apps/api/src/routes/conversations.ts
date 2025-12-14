@@ -20,10 +20,12 @@ import { getNextRunTime } from '../services/cron-parser';
 // Request validation schemas
 const createConversationSchema = z.object({
   title: z.string().optional(),
+  skills: z.array(z.string()).optional(),
 });
 
 const sendMessageSchema = z.object({
   content: z.string().min(1, 'Message content is required'),
+  skills: z.array(z.string()).optional(),
 });
 
 // Types for Hono context
@@ -41,6 +43,7 @@ interface DatabaseConnection {
     userId: string;
     title: string;
     status: ConversationStatus;
+    skills?: string[] | null;
   }): Promise<ConversationRecord>;
   getConversation(id: string): Promise<ConversationRecord | null>;
   getConversations(userId: string): Promise<ConversationRecord[]>;
@@ -75,6 +78,7 @@ interface ConversationRecord {
   pendingQuestionPrompt: string | null;
   pendingQuestionOptions: string[] | null;
   claudeSessionId: string | null;
+  skills: string[] | null;
   consecutiveFailures: string;
   createdAt: Date;
   updatedAt: Date;
@@ -102,7 +106,7 @@ export function createConversationRoutes(): Hono<Env> {
     '/',
     zValidator('json', createConversationSchema),
     async (c) => {
-      const { title } = c.req.valid('json');
+      const { title, skills } = c.req.valid('json');
       const userId = c.get('userId');
       const db = c.get('db');
 
@@ -110,6 +114,7 @@ export function createConversationRoutes(): Hono<Env> {
         userId,
         title: title || 'New Conversation',
         status: 'active',
+        skills: skills || null,
       });
 
       return c.json({
@@ -207,7 +212,7 @@ export function createConversationRoutes(): Hono<Env> {
     zValidator('json', sendMessageSchema),
     async (c) => {
       const conversationId = c.req.param('id');
-      const { content } = c.req.valid('json');
+      const { content, skills: requestSkills } = c.req.valid('json');
       const userId = c.get('userId');
       const db = c.get('db');
       const claudeClient = c.get('claudeClient');
@@ -266,11 +271,15 @@ export function createConversationRoutes(): Hono<Env> {
             }),
           });
 
+          // Determine skills to use: request skills override conversation skills
+          const activeSkills = requestSkills || conversation.skills || [];
+
           // Stream Claude's response
-          console.log(`[SSE] Starting Claude stream...`);
+          console.log(`[SSE] Starting Claude stream with skills: ${activeSkills.join(', ') || 'none'}`);
           for await (const message of claudeClient.stream({
             prompt,
             sessionId: conversation.claudeSessionId || undefined,
+            skills: activeSkills.length > 0 ? activeSkills : undefined,
           })) {
             if (aborted) break;
 
@@ -618,6 +627,7 @@ function formatConversationResponse(conversation: ConversationRecord) {
     userId: conversation.userId,
     title: conversation.title,
     status: conversation.status,
+    skills: conversation.skills || [],
     schedule: conversation.scheduleType
       ? {
           type: conversation.scheduleType,

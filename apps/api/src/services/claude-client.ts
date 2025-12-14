@@ -11,6 +11,7 @@
 
 import { query } from '@anthropic-ai/claude-agent-sdk';
 import type { UserMCPConfig } from '../../../../packages/shared-types/src';
+import { getSkill, mergeSkills } from '../config/skills';
 
 /**
  * Configuration for the Claude Agent Client
@@ -32,6 +33,8 @@ export interface ClaudeQueryOptions {
   mcpConfig?: UserMCPConfig;
   timeout?: number;
   allowedTools?: string[];
+  /** Skill names to activate for this query */
+  skills?: string[];
 }
 
 /**
@@ -180,7 +183,7 @@ export class ClaudeAgentClient {
    * Build query options for the SDK
    */
   private buildQueryOptions(options: ClaudeQueryOptions): Parameters<typeof query>[0] {
-    const mcpServers: Record<string, { command: string; args: string[] }> = {};
+    const mcpServers: Record<string, { command: string; args: string[]; env?: Record<string, string> }> = {};
 
     // Convert MCP config to SDK format
     if (options.mcpConfig?.servers && Array.isArray(options.mcpConfig.servers)) {
@@ -194,18 +197,60 @@ export class ClaudeAgentClient {
       }
     }
 
+    // Load and merge requested skills
+    const activeSkills = (options.skills || [])
+      .map((name) => getSkill(name))
+      .filter((skill): skill is NonNullable<typeof skill> => skill !== undefined);
+
+    const merged = mergeSkills(activeSkills);
+
+    // Merge skill tools with explicit allowedTools
+    const allTools = [
+      ...(options.allowedTools || this.config.defaultAllowedTools),
+      ...merged.tools,
+    ];
+
+    // Merge skill MCP servers with user's MCP config
+    for (const [name, config] of Object.entries(merged.mcpServers)) {
+      mcpServers[name] = {
+        command: config.command,
+        args: config.args || [],
+        ...(config.env && { env: config.env }),
+      };
+    }
+
+    // Build system prompt with skill additions
+    const systemPrompt = this.buildSystemPrompt(options.systemPrompt, merged.systemPromptAdditions);
+
     return {
       prompt: options.prompt,
       options: {
         cwd: process.cwd(),
-        systemPrompt: options.systemPrompt,
+        systemPrompt,
         resume: options.sessionId,
-        allowedTools: options.allowedTools || this.config.defaultAllowedTools,
+        allowedTools: [...new Set(allTools)],
         permissionMode: 'bypassPermissions' as const,
         maxTurns: 50,
+        ...(Object.keys(merged.subagents).length > 0 && { agents: merged.subagents }),
         ...(Object.keys(mcpServers).length > 0 && { mcpServers }),
       },
     };
+  }
+
+  /**
+   * Build system prompt with skill additions
+   */
+  private buildSystemPrompt(basePrompt?: string, skillAdditions?: string): string | undefined {
+    if (!basePrompt && !skillAdditions) {
+      return undefined;
+    }
+    if (!skillAdditions) {
+      return basePrompt;
+    }
+    if (!basePrompt) {
+      return skillAdditions;
+    }
+    return `${basePrompt}\n\n${skillAdditions}`;
   }
 
   /**

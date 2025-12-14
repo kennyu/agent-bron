@@ -62,6 +62,7 @@ interface ConversationRecord {
   pendingQuestionPrompt: string | null;
   pendingQuestionOptions: string[] | null;
   claudeSessionId: string | null;
+  skills: string[] | null;
   consecutiveFailures: string;
   createdAt: Date;
   updatedAt: Date;
@@ -104,6 +105,7 @@ interface ClaudeCodeClient {
     sessionId?: string;
     mcpConfig?: UserMCPConfig;
     timeout?: number;
+    skills?: string[];
   }): Promise<{
     response: string;
     sessionId: string;
@@ -237,13 +239,14 @@ export class BackgroundWorker {
     const systemPrompt = this.buildWorkerSystemPrompt();
     const prompt = this.buildWorkerPrompt(conversation, messages);
 
-    // 4. Run Claude Code
+    // 4. Run Claude Code with conversation's skills
     const result = await this.config.claudeClient.run({
       prompt,
       systemPrompt,
       sessionId: conversation.claudeSessionId || undefined,
       mcpConfig,
       timeout: this.config.executionTimeoutMs,
+      skills: conversation.skills || undefined,
     });
 
     // 5. Parse and handle response

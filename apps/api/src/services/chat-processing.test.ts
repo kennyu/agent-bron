@@ -25,6 +25,7 @@ interface MockConversation {
   pendingQuestionPrompt: string | null;
   pendingQuestionOptions: string[] | null;
   claudeSessionId: string | null;
+  skills: string[] | null;
   consecutiveFailures: string;
   createdAt: Date;
   updatedAt: Date;
@@ -57,6 +58,7 @@ function createMockConversation(overrides: Partial<MockConversation> = {}): Mock
     pendingQuestionPrompt: null,
     pendingQuestionOptions: null,
     claudeSessionId: null,
+    skills: null,
     consecutiveFailures: '0',
     createdAt: new Date(),
     updatedAt: new Date(),

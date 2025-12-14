@@ -206,6 +206,61 @@ export interface MCPServerConfig {
   env?: Record<string, string>;
 }
 
+// Skill system types
+
+/**
+ * MCP server configuration for skills (simplified format)
+ */
+export interface SkillMCPServerConfig {
+  command: string;
+  args?: string[];
+  env?: Record<string, string>;
+}
+
+/**
+ * Agent definition for nested subagents within a skill
+ */
+export interface AgentDefinition {
+  description: string;
+  prompt: string;
+  tools?: string[];
+  model?: 'sonnet' | 'opus' | 'haiku';
+}
+
+/**
+ * Skill definition - bundles tools, MCP servers, and subagents
+ */
+export interface Skill {
+  name: string;
+  description: string;
+  prompt: string;
+  tools?: string[];
+  model?: 'sonnet' | 'opus' | 'haiku';
+  mcpServers?: Record<string, SkillMCPServerConfig>;
+  subagents?: Record<string, AgentDefinition>;
+}
+
+/**
+ * Merged configuration from multiple skills
+ */
+export interface MergedSkillConfig {
+  tools: string[];
+  mcpServers: Record<string, SkillMCPServerConfig>;
+  subagents: Record<string, AgentDefinition>;
+  systemPromptAdditions: string;
+}
+
+/**
+ * API response for skill listing
+ */
+export interface SkillResponse {
+  name: string;
+  description: string;
+  tools: string[];
+  hasMcpServers: boolean;
+  hasSubagents: boolean;
+}
+
 export interface UserMCPConfig {
   servers: MCPServerConfig[];
 }

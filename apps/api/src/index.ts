@@ -10,6 +10,7 @@ import { cors } from 'hono/cors';
 import { logger } from 'hono/logger';
 import { createConversationRoutes } from './routes/conversations';
 import { createNotificationRoutes } from './routes/notifications';
+import { createSkillRoutes } from './routes/skills';
 import { createBackgroundWorker, type WorkerConfig } from './worker/background-worker';
 import { ChatProcessingService } from './services/chat-processing';
 import { createClaudeClient, type ClaudeAgentClient, type MockClaudeClient } from './services/claude-client';
@@ -117,6 +118,7 @@ export function createApp(config: {
   // Mount routes
   app.route('/conversations', createConversationRoutes());
   app.route('/notifications', createNotificationRoutes());
+  app.route('/skills', createSkillRoutes());
 
   // Error handler
   app.onError((err, c) => {

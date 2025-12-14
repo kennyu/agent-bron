@@ -68,6 +68,9 @@ export const conversations = pgTable(
     // Claude session resumption
     claudeSessionId: text('claude_session_id'),
 
+    // Skills to activate for this conversation
+    skills: jsonb('skills').$type<string[]>(),
+
     // Error tracking
     consecutiveFailures: text('consecutive_failures').default('0'),
 
