@@ -8,6 +8,13 @@
       "when": 1765704328911,
       "tag": "0000_sad_alice",
       "breakpoints": true
+    },
+    {
+      "idx": 1,
+      "version": "7",
+      "when": 1734170000000,
+      "tag": "0001_add_skills_column",
+      "breakpoints": true
     }
   ]
 }
