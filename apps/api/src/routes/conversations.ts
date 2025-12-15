@@ -8,11 +8,13 @@ import { Hono } from 'hono';
 import { streamSSE } from 'hono/streaming';
 import { zValidator } from '@hono/zod-validator';
 import { z } from 'zod';
-import type { ConversationStatus } from '../../../../packages/shared-types/src';
+import type { ConversationStatus, IntervalUnit, CreateTaskRequest } from '../../../../packages/shared-types/src';
 import {
   isCreateScheduleResponse,
   isChatNeedsInputResponse,
   isStateUpdateResponse,
+  isCreateTaskResponse,
+  isDeleteTaskResponse,
 } from '../../../../packages/shared-types/src';
 import type { ClaudeAgentClient, MockClaudeClient, ClaudeStreamMessage } from '../services/claude-client';
 import { getNextRunTime } from '../services/cron-parser';
@@ -51,6 +53,11 @@ interface DatabaseConnection {
   updateConversation(id: string, updates: Partial<ConversationRecord>): Promise<void>;
   deleteConversation(id: string): Promise<void>;
   insertMessage(message: Omit<MessageRecord, 'id' | 'createdAt'>): Promise<MessageRecord>;
+  // Task methods (optional for backwards compatibility)
+  getConversationTasks?(conversationId: string): Promise<unknown[]>;
+  createTask?(data: unknown): Promise<unknown>;
+  updateTask?(id: string, updates: unknown): Promise<void>;
+  findTaskByName?(conversationId: string, name: string): Promise<unknown>;
 }
 
 interface ChatProcessingService {
@@ -247,6 +254,73 @@ export function createConversationRoutes(): Hono<Env> {
         ? `${historyLines.join('\n\n')}\n\nuser: ${content}`
         : content;
 
+      // Load tasks for this conversation
+      const tasks = await db.getConversationTasks?.(conversationId) || [];
+      const activeTasks = tasks.filter((t: any) => t.status === 'active');
+
+      // Build system prompt with task scheduling instructions
+      const tasksJson = activeTasks.length > 0
+        ? JSON.stringify(activeTasks.map((t: any) => ({
+            id: t.id,
+            name: t.name,
+            schedule: t.intervalValue && t.intervalUnit
+              ? `every ${t.intervalValue} ${t.intervalUnit}`
+              : t.cronExpression,
+            currentRuns: parseInt(t.currentRuns || '0', 10),
+            maxRuns: t.maxRuns ? parseInt(t.maxRuns, 10) : null,
+          })), null, 2)
+        : 'No active tasks';
+
+      const systemPrompt = `You are an AI assistant that can create and manage scheduled tasks.
+
+ACTIVE SCHEDULED TASKS:
+${tasksJson}
+
+## Creating Scheduled Tasks
+
+To create a scheduled task, include in your response:
+{
+  "create_task": {
+    "name": "descriptive task name",
+    "intervalValue": 15,
+    "intervalUnit": "seconds",
+    "maxRuns": 10,
+    "durationSeconds": 300
+  },
+  "message": "Your response to user"
+}
+
+Schedule options:
+- intervalValue + intervalUnit: e.g., 15 seconds, 1 minute, 1 hour (minimum 15 seconds)
+- cronExpression: e.g., "*/5 * * * *" for every 5 minutes
+
+Expiration options (optional):
+- maxRuns: stop after N executions
+- durationSeconds: stop after N seconds
+
+## Deleting Tasks
+
+To delete/stop a task:
+{
+  "delete_task": { "taskName": "task name" },
+  "message": "Your response"
+}
+
+## Examples
+
+"say hello every 15 seconds" → intervalValue: 15, intervalUnit: "seconds"
+"remind me 5 times" → maxRuns: 5, intervalValue: 15, intervalUnit: "seconds"
+"stop saying hello" → delete_task with matching name
+
+For normal conversation without scheduling, just respond naturally without JSON.`;
+
+      // Debug: Log system prompt
+      console.log(`\n${'='.repeat(80)}`);
+      console.log(`[SSE] SYSTEM PROMPT for conversation ${conversationId.slice(0, 8)}:`);
+      console.log(`${'='.repeat(80)}`);
+      console.log(systemPrompt);
+      console.log(`${'='.repeat(80)}\n`);
+
       // Stream the response via SSE
       return streamSSE(c, async (stream) => {
         let fullResponse = '';
@@ -278,6 +352,7 @@ export function createConversationRoutes(): Hono<Env> {
           console.log(`[SSE] Starting Claude stream with skills: ${activeSkills.join(', ') || 'none'}`);
           for await (const message of claudeClient.stream({
             prompt,
+            systemPrompt,
             sessionId: conversation.claudeSessionId || undefined,
             skills: activeSkills.length > 0 ? activeSkills : undefined,
           })) {
@@ -389,6 +464,91 @@ export function createConversationRoutes(): Hono<Env> {
                 ...state_update,
               };
               console.log(`[SSE] State updated`);
+            }
+
+            // Handle task creation
+            if (isCreateTaskResponse(parsedResponse)) {
+              const taskRequest = parsedResponse.create_task;
+              console.log(`[SSE] 📋 TASK_CREATE detected: "${taskRequest.name}"`);
+
+              // Validate minimum interval
+              if (taskRequest.intervalValue && taskRequest.intervalUnit) {
+                const intervalMs = convertToMs(taskRequest.intervalValue, taskRequest.intervalUnit as IntervalUnit);
+                if (intervalMs >= 15000) {
+                  // Calculate expiresAt from durationSeconds
+                  let expiresAt: Date | undefined;
+                  if (taskRequest.durationSeconds) {
+                    expiresAt = new Date(Date.now() + taskRequest.durationSeconds * 1000);
+                  }
+
+                  // Calculate nextRunAt
+                  const nextRunAt = taskRequest.cronExpression
+                    ? getNextRunTime(taskRequest.cronExpression)
+                    : new Date(Date.now() + intervalMs);
+
+                  // Create task
+                  if (db.createTask) {
+                    await db.createTask({
+                      conversationId,
+                      userId,
+                      name: taskRequest.name,
+                      description: taskRequest.description,
+                      intervalValue: taskRequest.intervalValue?.toString(),
+                      intervalUnit: taskRequest.intervalUnit,
+                      cronExpression: taskRequest.cronExpression,
+                      nextRunAt,
+                      maxRuns: taskRequest.maxRuns?.toString(),
+                      expiresAt,
+                      taskContext: taskRequest.taskContext || {},
+                    });
+                    console.log(`[SSE] ✅ Task "${taskRequest.name}" created successfully`);
+                  }
+                } else {
+                  console.log(`[SSE] ⚠️ Task interval too small (min 15s): ${taskRequest.intervalValue} ${taskRequest.intervalUnit}`);
+                }
+              } else if (taskRequest.cronExpression) {
+                // Cron-based task
+                const nextRunAt = getNextRunTime(taskRequest.cronExpression);
+                let expiresAt: Date | undefined;
+                if (taskRequest.durationSeconds) {
+                  expiresAt = new Date(Date.now() + taskRequest.durationSeconds * 1000);
+                }
+
+                if (db.createTask) {
+                  await db.createTask({
+                    conversationId,
+                    userId,
+                    name: taskRequest.name,
+                    description: taskRequest.description,
+                    cronExpression: taskRequest.cronExpression,
+                    nextRunAt,
+                    maxRuns: taskRequest.maxRuns?.toString(),
+                    expiresAt,
+                    taskContext: taskRequest.taskContext || {},
+                  });
+                  console.log(`[SSE] ✅ Cron task "${taskRequest.name}" created successfully`);
+                }
+              }
+            }
+
+            // Handle task deletion
+            if (isDeleteTaskResponse(parsedResponse)) {
+              const { delete_task } = parsedResponse;
+              const target = delete_task.taskName || delete_task.taskId;
+              console.log(`[SSE] 🗑️ TASK_DELETE detected: "${target}"`);
+
+              if (delete_task.taskId && db.updateTask) {
+                await db.updateTask(delete_task.taskId, { status: 'deleted', nextRunAt: null });
+                console.log(`[SSE] ✅ Task deleted by ID`);
+              } else if (delete_task.taskName && db.findTaskByName) {
+                const task = await db.findTaskByName(conversationId, delete_task.taskName);
+                if (task && db.updateTask) {
+                  await db.updateTask((task as any).id, { status: 'deleted', nextRunAt: null });
+                  console.log(`[SSE] ✅ Task "${delete_task.taskName}" deleted`);
+                } else {
+                  console.log(`[SSE] ⚠️ Task "${delete_task.taskName}" not found`);
+                }
+              }
             }
 
             // Update conversation
@@ -665,6 +825,22 @@ function formatMessageResponse(message: MessageRecord) {
     source: message.source,
     createdAt: message.createdAt,
   };
+}
+
+/**
+ * Convert interval to milliseconds
+ */
+function convertToMs(value: number, unit: IntervalUnit): number {
+  switch (unit) {
+    case 'seconds':
+      return value * 1000;
+    case 'minutes':
+      return value * 60 * 1000;
+    case 'hours':
+      return value * 60 * 60 * 1000;
+    case 'days':
+      return value * 24 * 60 * 60 * 1000;
+  }
 }
 
 /**

@@ -123,12 +123,12 @@ export class BackgroundWorker {
 
   constructor(config: WorkerConfig) {
     this.config = {
-      pollIntervalMs: 5000,
-      maxConcurrent: 5,
-      maxMessagesToInclude: 20,
-      executionTimeoutMs: 300000, // 5 minutes
-      maxRetries: 3,
       ...config,
+      pollIntervalMs: config.pollIntervalMs ?? 5000,
+      maxConcurrent: config.maxConcurrent ?? 5,
+      maxMessagesToInclude: config.maxMessagesToInclude ?? 20,
+      executionTimeoutMs: config.executionTimeoutMs ?? 300000, // 5 minutes
+      maxRetries: config.maxRetries ?? 3,
     };
   }
 

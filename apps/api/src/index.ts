@@ -11,7 +11,9 @@ import { logger } from 'hono/logger';
 import { createConversationRoutes } from './routes/conversations';
 import { createNotificationRoutes } from './routes/notifications';
 import { createSkillRoutes } from './routes/skills';
+import { createTaskRoutes } from './routes/tasks';
 import { createBackgroundWorker, type WorkerConfig } from './worker/background-worker';
+import { createTaskWorker, type TaskWorkerConfig } from './worker/task-worker';
 import { ChatProcessingService } from './services/chat-processing';
 import { createClaudeClient, type ClaudeAgentClient, type MockClaudeClient } from './services/claude-client';
 
@@ -49,6 +51,16 @@ interface DatabaseConnection {
 
   // Worker methods
   getReadyConversations(limit: number): Promise<unknown[]>;
+
+  // Task methods
+  createTask(data: unknown): Promise<unknown>;
+  getTask(id: string): Promise<unknown>;
+  getTasks(userId: string, conversationId?: string): Promise<unknown[]>;
+  updateTask(id: string, updates: unknown): Promise<void>;
+  deleteTask(id: string): Promise<void>;
+  getConversationTasks(conversationId: string): Promise<unknown[]>;
+  findTaskByName(conversationId: string, name: string): Promise<unknown>;
+  getReadyTasks(limit: number): Promise<unknown[]>;
 }
 
 // Claude Code client interface (used by ChatProcessingService and BackgroundWorker)
@@ -119,6 +131,7 @@ export function createApp(config: {
   app.route('/conversations', createConversationRoutes());
   app.route('/notifications', createNotificationRoutes());
   app.route('/skills', createSkillRoutes());
+  app.route('/tasks', createTaskRoutes());
 
   // Error handler
   app.onError((err, c) => {
@@ -141,7 +154,7 @@ export function createApp(config: {
 }
 
 /**
- * Start the server with background worker
+ * Start the server with background worker and task worker
  */
 export async function startServer(config: {
   port: number;
@@ -149,9 +162,11 @@ export async function startServer(config: {
   claudeClient: ClaudeAgentClient | MockClaudeClient;
   encryptionKey: Buffer;
   workerConfig?: Partial<WorkerConfig>;
+  taskWorkerConfig?: Partial<TaskWorkerConfig>;
 }): Promise<{
   app: Hono<Env>;
   worker: ReturnType<typeof createBackgroundWorker>;
+  taskWorker: ReturnType<typeof createTaskWorker>;
   stop: () => void;
 }> {
   // Create API app
@@ -161,7 +176,7 @@ export async function startServer(config: {
     encryptionKey: config.encryptionKey,
   });
 
-  // Create and start background worker
+  // Create and start background worker (for conversation-based schedules)
   const worker = createBackgroundWorker({
     db: config.db as unknown as WorkerConfig['db'],
     claudeClient: config.claudeClient as unknown as WorkerConfig['claudeClient'],
@@ -173,18 +188,34 @@ export async function startServer(config: {
     maxRetries: config.workerConfig?.maxRetries ?? 3,
   });
 
+  // Create and start task worker (for task-based schedules)
+  const taskWorker = createTaskWorker({
+    db: config.db as unknown as TaskWorkerConfig['db'],
+    claudeClient: config.claudeClient as unknown as TaskWorkerConfig['claudeClient'],
+    encryptionKey: config.encryptionKey,
+    pollIntervalMs: config.taskWorkerConfig?.pollIntervalMs ?? 5000,
+    maxConcurrent: config.taskWorkerConfig?.maxConcurrent ?? 5,
+    maxMessagesToInclude: config.taskWorkerConfig?.maxMessagesToInclude ?? 20,
+    executionTimeoutMs: config.taskWorkerConfig?.executionTimeoutMs ?? 300000,
+    maxRetries: config.taskWorkerConfig?.maxRetries ?? 3,
+    minIntervalSeconds: config.taskWorkerConfig?.minIntervalSeconds ?? 15,
+  });
+
   worker.start();
+  taskWorker.start();
 
   console.log(`Server starting on port ${config.port}`);
   console.log('Background worker started');
+  console.log('Task worker started');
 
   // Return cleanup function
   const stop = () => {
     worker.stop();
+    taskWorker.stop();
     console.log('Server stopped');
   };
 
-  return { app, worker, stop };
+  return { app, worker, taskWorker, stop };
 }
 
 // Development server startup
@@ -208,8 +239,8 @@ if (import.meta.main) {
   const { db } = await import('../../../packages/db/src');
   console.log('[API] Database module loaded');
 
-  const { eq, and, lte, isNotNull, sql } = await import('drizzle-orm');
-  const { conversations, messages, notifications, userIntegrations } = await import('../../../packages/db/src/schema');
+  const { eq, and, lte, isNotNull, sql, ilike } = await import('drizzle-orm');
+  const { conversations, messages, notifications, userIntegrations, tasks } = await import('../../../packages/db/src/schema');
   console.log('[API] Schema loaded');
 
   // Create database adapter
@@ -280,6 +311,49 @@ if (import.meta.main) {
         ))
         .limit(limit);
     },
+
+    // Task methods
+    async createTask(data: any) {
+      const [task] = await db.insert(tasks).values(data).returning();
+      return task;
+    },
+    async getTask(id) {
+      const [task] = await db.select().from(tasks).where(eq(tasks.id, id));
+      return task || null;
+    },
+    async getTasks(userId, conversationId) {
+      if (conversationId) {
+        return db.select().from(tasks)
+          .where(and(eq(tasks.userId, userId), eq(tasks.conversationId, conversationId)));
+      }
+      return db.select().from(tasks).where(eq(tasks.userId, userId));
+    },
+    async updateTask(id, updates: any) {
+      await db.update(tasks).set(updates).where(eq(tasks.id, id));
+    },
+    async deleteTask(id) {
+      await db.update(tasks).set({ status: 'deleted', nextRunAt: null }).where(eq(tasks.id, id));
+    },
+    async getConversationTasks(conversationId) {
+      return db.select().from(tasks).where(eq(tasks.conversationId, conversationId));
+    },
+    async findTaskByName(conversationId, name) {
+      const [task] = await db.select().from(tasks)
+        .where(and(
+          eq(tasks.conversationId, conversationId),
+          ilike(tasks.name, name)
+        ));
+      return task || null;
+    },
+    async getReadyTasks(limit) {
+      const now = new Date();
+      return db.select().from(tasks)
+        .where(and(
+          eq(tasks.status, 'active'),
+          lte(tasks.nextRunAt, now)
+        ))
+        .limit(limit);
+    },
   };
 
   // Create Claude client (uses real SDK if ANTHROPIC_API_KEY is set, otherwise mock)
@@ -303,7 +377,7 @@ if (import.meta.main) {
   });
   console.log('[API] Hono app created');
 
-  // Start background worker
+  // Start background worker (for conversation-based schedules)
   console.log('[API] Creating background worker...');
   const worker = createBackgroundWorker({
     db: dbAdapter as unknown as WorkerConfig['db'],
@@ -318,11 +392,28 @@ if (import.meta.main) {
   worker.start();
   console.log('[API] Background worker started');
 
+  // Start task worker (for task-based schedules)
+  console.log('[API] Creating task worker...');
+  const taskWorker = createTaskWorker({
+    db: dbAdapter as unknown as TaskWorkerConfig['db'],
+    claudeClient: claudeClient as unknown as TaskWorkerConfig['claudeClient'],
+    encryptionKey,
+    pollIntervalMs: 5000,
+    maxConcurrent: 5,
+    maxMessagesToInclude: 20,
+    executionTimeoutMs: 300000,
+    maxRetries: 3,
+    minIntervalSeconds: 15,
+  });
+  taskWorker.start();
+  console.log('[API] Task worker started');
+
   const port = parseInt(process.env.PORT || '3000');
 
   console.log(`[API] Starting Bun server on port ${port}...`);
+  let server: ReturnType<typeof Bun.serve>;
   try {
-    const server = Bun.serve({
+    server = Bun.serve({
       port,
       fetch: app.fetch,
       idleTimeout: 120, // 2 minutes for SSE streams
@@ -330,6 +421,7 @@ if (import.meta.main) {
 
     console.log(`[API] Server running at http://localhost:${server.port}`);
     console.log('[API] Background worker polling every 5s');
+    console.log('[API] Task worker polling every 5s (15s min interval)');
   } catch (err) {
     console.error('[API] Failed to start server:', err);
     process.exit(1);
@@ -339,6 +431,7 @@ if (import.meta.main) {
   process.on('SIGINT', () => {
     console.log('Shutting down...');
     worker.stop();
+    taskWorker.stop();
     server.stop();
     process.exit(0);
   });

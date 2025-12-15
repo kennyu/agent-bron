@@ -88,21 +88,26 @@ export class ClaudeAgentClient {
     let sessionId = '';
 
     const queryOptions = this.buildQueryOptions(options);
+    console.log('[ClaudeAgentClient] run() called with prompt:', options.prompt.slice(0, 100) + '...');
 
     for await (const message of query(queryOptions)) {
+      console.log('[ClaudeAgentClient] run() received:', message.type);
+
       // Extract session ID from init message
       if (message.type === 'system' && (message as any).subtype === 'init') {
         sessionId = (message as any).session_id || '';
       }
 
       // Aggregate assistant text
+      // SDK wraps content in message.message.content OR message.content
       if (message.type === 'assistant') {
-        const content = (message as any).content;
-        if (typeof content === 'string') {
-          responseText += content;
-        } else if (Array.isArray(content)) {
+        const messageContent = (message as any).message?.content || (message as any).content;
+
+        if (typeof messageContent === 'string') {
+          responseText += messageContent;
+        } else if (Array.isArray(messageContent)) {
           // Handle content blocks
-          for (const block of content) {
+          for (const block of messageContent) {
             if (block.type === 'text') {
               responseText += block.text;
             }
@@ -111,6 +116,7 @@ export class ClaudeAgentClient {
       }
     }
 
+    console.log('[ClaudeAgentClient] run() completed, response length:', responseText.length);
     return {
       response: responseText,
       sessionId,

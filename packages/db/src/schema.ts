@@ -33,6 +33,22 @@ export const messageRoleEnum = pgEnum('message_role', [
 // Message source enum
 export const messageSourceEnum = pgEnum('message_source', ['chat', 'worker']);
 
+// Task status enum
+export const taskStatusEnum = pgEnum('task_status', [
+  'active',
+  'paused',
+  'completed',
+  'deleted',
+]);
+
+// Interval unit enum
+export const intervalUnitEnum = pgEnum('interval_unit', [
+  'seconds',
+  'minutes',
+  'hours',
+  'days',
+]);
+
 // Pending question type enum
 export const pendingQuestionTypeEnum = pgEnum('pending_question_type', [
   'confirmation',
@@ -177,6 +193,64 @@ export const notifications = pgTable(
   ]
 );
 
+// Tasks table
+export const tasks = pgTable(
+  'tasks',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    conversationId: uuid('conversation_id')
+      .notNull()
+      .references(() => conversations.id, { onDelete: 'cascade' }),
+    userId: uuid('user_id').notNull(),
+
+    // Task identity
+    name: text('name').notNull(),
+    description: text('description'),
+
+    // Status
+    status: taskStatusEnum('status').notNull().default('active'),
+
+    // Interval-based scheduling
+    intervalValue: text('interval_value'),
+    intervalUnit: intervalUnitEnum('interval_unit'),
+
+    // Cron-based scheduling (alternative)
+    cronExpression: text('cron_expression'),
+
+    // Execution timing
+    nextRunAt: timestamp('next_run_at', { withTimezone: true }),
+    lastRunAt: timestamp('last_run_at', { withTimezone: true }),
+
+    // Expiration limits
+    maxRuns: text('max_runs'),
+    currentRuns: text('current_runs').default('0'),
+    expiresAt: timestamp('expires_at', { withTimezone: true }),
+
+    // Task context
+    taskContext: jsonb('task_context').$type<Record<string, unknown>>(),
+
+    // Error tracking
+    consecutiveFailures: text('consecutive_failures').default('0'),
+    lastError: text('last_error'),
+
+    // Timestamps
+    createdAt: timestamp('created_at', { withTimezone: true })
+      .notNull()
+      .defaultNow(),
+    updatedAt: timestamp('updated_at', { withTimezone: true })
+      .notNull()
+      .defaultNow(),
+  },
+  (table) => [
+    // Index for worker query: status + next_run_at
+    index('idx_tasks_worker_query').on(table.status, table.nextRunAt),
+    // Index for conversation's tasks
+    index('idx_tasks_conversation_id').on(table.conversationId),
+    // Index for user's tasks
+    index('idx_tasks_user_id').on(table.userId),
+  ]
+);
+
 // Type exports for use in application code
 export type Conversation = typeof conversations.$inferSelect;
 export type NewConversation = typeof conversations.$inferInsert;
@@ -186,3 +260,5 @@ export type UserIntegration = typeof userIntegrations.$inferSelect;
 export type NewUserIntegration = typeof userIntegrations.$inferInsert;
 export type Notification = typeof notifications.$inferSelect;
 export type NewNotification = typeof notifications.$inferInsert;
+export type Task = typeof tasks.$inferSelect;
+export type NewTask = typeof tasks.$inferInsert;

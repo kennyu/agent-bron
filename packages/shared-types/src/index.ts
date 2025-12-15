@@ -8,6 +8,10 @@ export type ConversationStatus =
 // Schedule types
 export type ScheduleType = 'cron' | 'scheduled' | 'immediate';
 
+// Task types
+export type TaskStatus = 'active' | 'paused' | 'completed' | 'deleted';
+export type IntervalUnit = 'seconds' | 'minutes' | 'hours' | 'days';
+
 export interface Schedule {
   type: ScheduleType;
   cronExpression?: string;
@@ -81,6 +85,41 @@ export interface Notification {
   body: string;
   isRead: boolean;
   createdAt: Date;
+}
+
+// Task interface
+export interface Task {
+  id: string;
+  conversationId: string;
+  userId: string;
+  name: string;
+  description?: string;
+  status: TaskStatus;
+  intervalValue?: number;
+  intervalUnit?: IntervalUnit;
+  cronExpression?: string;
+  nextRunAt?: Date;
+  lastRunAt?: Date;
+  maxRuns?: number;
+  currentRuns: number;
+  expiresAt?: Date;
+  taskContext: Record<string, unknown>;
+  consecutiveFailures: number;
+  lastError?: string;
+  createdAt: Date;
+  updatedAt: Date;
+}
+
+// Request type for creating tasks
+export interface CreateTaskRequest {
+  name: string;
+  description?: string;
+  intervalValue?: number;
+  intervalUnit?: IntervalUnit;
+  cronExpression?: string;
+  maxRuns?: number;
+  durationSeconds?: number;
+  taskContext?: Record<string, unknown>;
 }
 
 // Claude response types for worker
@@ -162,7 +201,28 @@ export type ChatResponse =
   | CreateScheduleResponse
   | ChatNeedsInputResponse
   | StateUpdateResponse
+  | CreateTaskResponse
+  | DeleteTaskResponse
   | { message: string }; // Plain response
+
+/**
+ * Response when Claude wants to create a scheduled task
+ */
+export interface CreateTaskResponse {
+  create_task: CreateTaskRequest;
+  message: string;
+}
+
+/**
+ * Response when Claude wants to delete a task
+ */
+export interface DeleteTaskResponse {
+  delete_task: {
+    taskId?: string;
+    taskName?: string;
+  };
+  message: string;
+}
 
 // API request/response types
 
@@ -328,5 +388,27 @@ export function isStateUpdateResponse(
     typeof response === 'object' &&
     response !== null &&
     'state_update' in response
+  );
+}
+
+export function isCreateTaskResponse(
+  response: unknown
+): response is CreateTaskResponse {
+  return (
+    typeof response === 'object' &&
+    response !== null &&
+    'create_task' in response &&
+    typeof (response as CreateTaskResponse).create_task === 'object'
+  );
+}
+
+export function isDeleteTaskResponse(
+  response: unknown
+): response is DeleteTaskResponse {
+  return (
+    typeof response === 'object' &&
+    response !== null &&
+    'delete_task' in response &&
+    typeof (response as DeleteTaskResponse).delete_task === 'object'
   );
 }

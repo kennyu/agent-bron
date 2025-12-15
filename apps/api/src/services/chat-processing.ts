@@ -13,11 +13,16 @@ import type {
   PendingQuestion,
   ChatResponse,
   UserMCPConfig,
+  CreateTaskRequest,
+  IntervalUnit,
+  TaskStatus,
 } from '../../../../packages/shared-types/src/index';
 import {
   isCreateScheduleResponse,
   isChatNeedsInputResponse,
   isStateUpdateResponse,
+  isCreateTaskResponse,
+  isDeleteTaskResponse,
 } from '../../../../packages/shared-types/src/index';
 import { getNextRunTime } from './cron-parser';
 import {
@@ -36,6 +41,11 @@ interface DatabaseConnection {
   updateConversation(id: string, updates: Partial<ConversationRecord>): Promise<void>;
   insertMessage(message: Omit<MessageRecord, 'id' | 'createdAt'>): Promise<MessageRecord>;
   createNotification(notification: NotificationInput): Promise<void>;
+  // Task methods
+  getConversationTasks(conversationId: string): Promise<TaskRecord[]>;
+  createTask(task: NewTaskRecord): Promise<TaskRecord>;
+  updateTask(id: string, updates: Partial<TaskRecord>): Promise<void>;
+  findTaskByName(conversationId: string, name: string): Promise<TaskRecord | null>;
 }
 
 interface ConversationRecord {
@@ -84,6 +94,42 @@ interface NotificationInput {
   conversationId: string;
   title: string;
   body: string;
+}
+
+interface TaskRecord {
+  id: string;
+  conversationId: string;
+  userId: string;
+  name: string;
+  description: string | null;
+  status: TaskStatus;
+  intervalValue: string | null;
+  intervalUnit: IntervalUnit | null;
+  cronExpression: string | null;
+  nextRunAt: Date | null;
+  lastRunAt: Date | null;
+  maxRuns: string | null;
+  currentRuns: string;
+  expiresAt: Date | null;
+  taskContext: Record<string, unknown> | null;
+  consecutiveFailures: string;
+  lastError: string | null;
+  createdAt: Date;
+  updatedAt: Date;
+}
+
+interface NewTaskRecord {
+  conversationId: string;
+  userId: string;
+  name: string;
+  description?: string;
+  intervalValue?: string;
+  intervalUnit?: IntervalUnit;
+  cronExpression?: string;
+  nextRunAt?: Date;
+  maxRuns?: string;
+  expiresAt?: Date;
+  taskContext?: Record<string, unknown>;
 }
 
 /**
@@ -153,7 +199,10 @@ export class ChatProcessingService {
 
     const messages = await this.db.getMessages(conversationId, this.maxMessageHistory);
 
-    // 2. Load user's MCP configs with credential decryption
+    // 2. Load conversation's tasks
+    const tasks = await this.db.getConversationTasks(conversationId);
+
+    // 3. Load user's MCP configs with credential decryption
     const integrations = await this.db.getUserIntegrations(conversation.userId);
     const activeIntegrations = integrations.filter((i) => i.isActive === 'true');
     const mcpConfig = buildUserMCPConfig(
@@ -167,7 +216,7 @@ export class ChatProcessingService {
       this.encryptionKey
     );
 
-    // 3. Insert user message
+    // 4. Insert user message
     const userMessage = await this.db.insertMessage({
       conversationId,
       role: 'user',
@@ -175,13 +224,20 @@ export class ChatProcessingService {
       source: 'chat',
     });
 
-    // 4. Build system prompt with context
-    const systemPrompt = this.buildSystemPrompt(conversation, activeIntegrations);
+    // 5. Build system prompt with context and tasks
+    const systemPrompt = this.buildSystemPrompt(conversation, activeIntegrations, tasks);
 
-    // 5. Build conversation prompt with message history
+    // Debug: Log system prompt
+    console.log(`\n${'='.repeat(80)}`);
+    console.log(`[ChatProcessing] SYSTEM PROMPT for conversation ${conversationId.slice(0, 8)}:`);
+    console.log(`${'='.repeat(80)}`);
+    console.log(systemPrompt);
+    console.log(`${'='.repeat(80)}\n`);
+
+    // 6. Build conversation prompt with message history
     const prompt = this.buildPrompt(messages, userContent, conversation);
 
-    // 6. Call Claude Code SDK
+    // 7. Call Claude Code SDK
     const result = await this.claudeClient.run({
       prompt,
       systemPrompt,
@@ -190,17 +246,20 @@ export class ChatProcessingService {
       timeout: 120000, // 2 minutes
     });
 
-    // 7. Parse Claude's response
+    // 8. Parse Claude's response
     const parsedResponse = this.parseClaudeResponse(result.response);
 
-    // 8. Update conversation based on response
+    // Log response classification
+    this.logResponseClassification(parsedResponse, conversationId);
+
+    // 9. Update conversation and handle tasks based on response
     const updates = await this.handleChatResponse(
       conversation,
       parsedResponse,
       result.sessionId
     );
 
-    // 9. Insert assistant message
+    // 10. Insert assistant message
     const assistantMessage = await this.db.insertMessage({
       conversationId,
       role: 'assistant',
@@ -231,11 +290,12 @@ export class ChatProcessingService {
   }
 
   /**
-   * Build system prompt with user integrations and conversation state
+   * Build system prompt with user integrations, conversation state, and tasks
    */
   private buildSystemPrompt(
     conversation: ConversationRecord,
-    integrations: IntegrationRecord[]
+    integrations: IntegrationRecord[],
+    tasks: TaskRecord[]
   ): string {
     const connectedProviders = integrations.map((i) => i.provider);
     const availableIntegrations = getAvailableIntegrations(connectedProviders);
@@ -262,6 +322,28 @@ export class ChatProcessingService {
       2
     );
 
+    // Format active tasks for Claude
+    const activeTasks = tasks.filter((t) => t.status === 'active');
+    const tasksJson =
+      activeTasks.length > 0
+        ? JSON.stringify(
+            activeTasks.map((t) => ({
+              id: t.id,
+              name: t.name,
+              schedule:
+                t.intervalValue && t.intervalUnit
+                  ? `every ${t.intervalValue} ${t.intervalUnit}`
+                  : t.cronExpression,
+              currentRuns: parseInt(t.currentRuns, 10),
+              maxRuns: t.maxRuns ? parseInt(t.maxRuns, 10) : null,
+              expiresAt: t.expiresAt?.toISOString() || null,
+              lastRunAt: t.lastRunAt?.toISOString() || null,
+            })),
+            null,
+            2
+          )
+        : 'No active tasks';
+
     let statusContext = '';
     if (conversation.status === 'waiting_input' && conversation.pendingQuestionPrompt) {
       statusContext = `User is responding to: "${conversation.pendingQuestionPrompt}"`;
@@ -272,7 +354,7 @@ export class ChatProcessingService {
       }
     }
 
-    return `You are an AI assistant in a conversation that may have background work.
+    return `You are an AI assistant in a conversation that can create and manage scheduled tasks.
 
 USER'S CONNECTED INTEGRATIONS:
 ${connectedList}
@@ -283,6 +365,9 @@ ${availableList}
 CONVERSATION STATE:
 ${stateJson}
 
+ACTIVE SCHEDULED TASKS:
+${tasksJson}
+
 CONVERSATION STATUS: ${conversation.status}
 ${statusContext}
 
@@ -290,25 +375,84 @@ INSTRUCTIONS:
 
 For normal conversation, just respond naturally.
 
-To create background/scheduled work, include in your response:
+## Creating Scheduled Tasks
+
+To create a scheduled task, include in your response:
 {
-  "create_schedule": { "type": "cron|scheduled|immediate", "cron_expression": "...", "initial_state": {...} },
+  "create_task": {
+    "name": "descriptive task name",
+    "description": "what this task does (optional)",
+    "intervalValue": 15,
+    "intervalUnit": "seconds",
+    "maxRuns": 10,
+    "durationSeconds": 300,
+    "taskContext": { "greeting": "Hello!" }
+  },
   "message": "Your response to user"
 }
 
-To ask for user input (question, confirmation, choice), include:
+### Schedule Options (pick ONE):
+
+**Interval-based** (minimum 15 seconds):
+- intervalValue: number (e.g., 15, 30, 1, 5)
+- intervalUnit: "seconds" | "minutes" | "hours" | "days"
+
+**Cron-based** (minimum 1 minute):
+- cronExpression: standard 5-field cron (e.g., "*/5 * * * *" for every 5 minutes)
+
+### Expiration Options (optional, can use both):
+
+- maxRuns: stop after N executions (e.g., 10)
+- durationSeconds: stop after N seconds from now (e.g., 300 for 5 minutes)
+
+## Deleting Tasks
+
+To delete/stop a task:
+{
+  "delete_task": {
+    "taskName": "task name to stop"
+  },
+  "message": "Your response"
+}
+
+Or by ID:
+{
+  "delete_task": {
+    "taskId": "uuid-of-task"
+  },
+  "message": "Your response"
+}
+
+## Natural Language Examples:
+
+| User says | You create |
+|-----------|------------|
+| "say hello every 15 seconds" | intervalValue: 15, intervalUnit: "seconds" |
+| "remind me every hour" | intervalValue: 1, intervalUnit: "hours" |
+| "check weather every 5 minutes for 1 hour" | intervalValue: 5, intervalUnit: "minutes", durationSeconds: 3600 |
+| "say hi 5 times" | maxRuns: 5, intervalValue: 15, intervalUnit: "seconds" |
+| "stop saying hello" | delete_task with matching name |
+
+## Important Rules:
+
+1. Minimum interval is 15 seconds - explain this if user asks for faster
+2. Task names should be descriptive and unique within the conversation
+3. Always confirm what you're creating/deleting in your message
+4. If user asks to stop/cancel something, look at ACTIVE SCHEDULED TASKS and use delete_task
+
+## Other Actions
+
+To ask for user input:
 {
   "needs_input": { "type": "confirmation|choice|input", "prompt": "...", "options": [...] },
   "message": "Your response to user"
 }
 
-To update conversation state without scheduling:
+To update conversation state:
 {
   "state_update": { "key": "value" },
   "message": "Your response"
 }
-
-If user is responding to a pending question, process their answer appropriately.
 
 For requests requiring unconnected integrations, explain that the user needs to connect them in Settings.`;
   }
@@ -427,6 +571,16 @@ For requests requiring unconnected integrations, explain that the user needs to 
       };
     }
 
+    // Handle task creation
+    if (isCreateTaskResponse(response)) {
+      await this.handleCreateTask(conversation, response.create_task);
+    }
+
+    // Handle task deletion
+    if (isDeleteTaskResponse(response)) {
+      await this.handleDeleteTask(conversation, response.delete_task);
+    }
+
     // If user was answering a question and we got a plain response,
     // clear the pending question and potentially resume background work
     else if (
@@ -461,6 +615,166 @@ For requests requiring unconnected integrations, explain that the user needs to 
       updated: Object.keys(updates).length > 2, // More than just sessionId and updatedAt
       newStatus,
     };
+  }
+
+  /**
+   * Create a new scheduled task from Claude's response
+   */
+  private async handleCreateTask(
+    conversation: ConversationRecord,
+    request: CreateTaskRequest
+  ): Promise<void> {
+    // 1. Validate minimum interval (15 seconds)
+    if (request.intervalValue && request.intervalUnit) {
+      const intervalMs = this.convertToMs(request.intervalValue, request.intervalUnit);
+      if (intervalMs < 15000) {
+        console.warn('[ChatProcessing] Task interval too small, minimum is 15 seconds');
+        return;
+      }
+    }
+
+    // 2. Validate that either interval OR cron is provided
+    const hasInterval = request.intervalValue && request.intervalUnit;
+    const hasCron = !!request.cronExpression;
+    if (!hasInterval && !hasCron) {
+      console.warn('[ChatProcessing] Task must have either interval or cronExpression');
+      return;
+    }
+
+    // 3. Calculate expiresAt from durationSeconds
+    let expiresAt: Date | undefined;
+    if (request.durationSeconds) {
+      expiresAt = new Date(Date.now() + request.durationSeconds * 1000);
+    }
+
+    // 4. Calculate initial nextRunAt
+    const nextRunAt = this.calculateNextRunAt(
+      request.intervalValue,
+      request.intervalUnit,
+      request.cronExpression
+    );
+
+    // 5. Insert task into database
+    await this.db.createTask({
+      conversationId: conversation.id,
+      userId: conversation.userId,
+      name: request.name,
+      description: request.description,
+      intervalValue: request.intervalValue?.toString(),
+      intervalUnit: request.intervalUnit,
+      cronExpression: request.cronExpression,
+      nextRunAt,
+      maxRuns: request.maxRuns?.toString(),
+      expiresAt,
+      taskContext: request.taskContext || {},
+    });
+
+    console.log(`[ChatProcessing] Task "${request.name}" created for conversation ${conversation.id}`);
+  }
+
+  /**
+   * Delete a task by ID or name
+   */
+  private async handleDeleteTask(
+    conversation: ConversationRecord,
+    request: { taskId?: string; taskName?: string }
+  ): Promise<void> {
+    let taskId = request.taskId;
+
+    // If name provided, find the task
+    if (!taskId && request.taskName) {
+      const task = await this.db.findTaskByName(conversation.id, request.taskName);
+      if (!task) {
+        console.warn(
+          `[ChatProcessing] Task "${request.taskName}" not found in conversation ${conversation.id}`
+        );
+        return;
+      }
+      taskId = task.id;
+    }
+
+    if (!taskId) {
+      console.warn('[ChatProcessing] No taskId or taskName provided for deletion');
+      return;
+    }
+
+    // Soft delete: set status to 'deleted'
+    await this.db.updateTask(taskId, {
+      status: 'deleted',
+      nextRunAt: null,
+      updatedAt: new Date(),
+    });
+
+    console.log(`[ChatProcessing] Task ${taskId} deleted from conversation ${conversation.id}`);
+  }
+
+  /**
+   * Convert interval to milliseconds
+   */
+  private convertToMs(value: number, unit: IntervalUnit): number {
+    switch (unit) {
+      case 'seconds':
+        return value * 1000;
+      case 'minutes':
+        return value * 60 * 1000;
+      case 'hours':
+        return value * 60 * 60 * 1000;
+      case 'days':
+        return value * 24 * 60 * 60 * 1000;
+    }
+  }
+
+  /**
+   * Calculate next run time based on schedule
+   */
+  private calculateNextRunAt(
+    intervalValue?: number,
+    intervalUnit?: IntervalUnit,
+    cronExpression?: string
+  ): Date {
+    const now = new Date();
+
+    if (cronExpression) {
+      return getNextRunTime(cronExpression);
+    }
+
+    if (intervalValue && intervalUnit) {
+      const intervalMs = this.convertToMs(intervalValue, intervalUnit);
+      return new Date(now.getTime() + intervalMs);
+    }
+
+    return now;
+  }
+
+  /**
+   * Log the classification of Claude's response
+   */
+  private logResponseClassification(response: ChatResponse, conversationId: string): void {
+    const timestamp = new Date().toISOString();
+    const prefix = `[ChatProcessing][${timestamp}][${conversationId.slice(0, 8)}]`;
+
+    if (isCreateTaskResponse(response)) {
+      const task = response.create_task;
+      const schedule = task.intervalValue && task.intervalUnit
+        ? `every ${task.intervalValue} ${task.intervalUnit}`
+        : task.cronExpression || 'unknown';
+      console.log(`${prefix} 📋 TASK_CREATE: "${task.name}" | Schedule: ${schedule} | MaxRuns: ${task.maxRuns || 'unlimited'} | Duration: ${task.durationSeconds ? `${task.durationSeconds}s` : 'unlimited'}`);
+    } else if (isDeleteTaskResponse(response)) {
+      const target = response.delete_task.taskName || response.delete_task.taskId || 'unknown';
+      console.log(`${prefix} 🗑️  TASK_DELETE: "${target}"`);
+    } else if (isCreateScheduleResponse(response)) {
+      const sched = response.create_schedule;
+      console.log(`${prefix} ⏰ SCHEDULE_CREATE: type=${sched.type} | cron=${sched.cron_expression || 'none'} | runAt=${sched.run_at || 'none'}`);
+    } else if (isChatNeedsInputResponse(response)) {
+      const input = response.needs_input;
+      console.log(`${prefix} ❓ NEEDS_INPUT: type=${input.type} | prompt="${input.prompt.slice(0, 50)}..."`);
+    } else if (isStateUpdateResponse(response)) {
+      const keys = Object.keys(response.state_update);
+      console.log(`${prefix} 🔄 STATE_UPDATE: keys=[${keys.join(', ')}]`);
+    } else {
+      const msgPreview = response.message?.slice(0, 80) || 'no message';
+      console.log(`${prefix} 💬 PLAIN_RESPONSE: "${msgPreview}..."`);
+    }
   }
 }
 
